@@ -1145,3 +1145,249 @@ test "full autonomy wildcard: arbitrary commands allowed" {
     try std.testing.expect(p.isCommandAllowed("make all"));
     try std.testing.expect(p.isCommandAllowed("zig build test"));
 }
+
+// ── Comprehensive autonomy × allowed_commands matrix ──
+
+test "full autonomy + default allowed_commands: permits listed, blocks unlisted" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        // default allowed_commands = default_allowed_commands (ls, echo, git, …)
+    };
+    // Default command passes
+    try std.testing.expect(p.isCommandAllowed("ls -la"));
+    try std.testing.expect(p.isCommandAllowed("echo hello"));
+    // Non-default command blocked
+    try std.testing.expect(!p.isCommandAllowed("uname -a"));
+    try std.testing.expect(!p.isCommandAllowed("date"));
+}
+
+test "full autonomy + specific allowed_commands: permits only specified command" {
+    const specific = [_][]const u8{"uname"};
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &specific,
+    };
+    try std.testing.expect(p.isCommandAllowed("uname -a"));
+    // Default command not in specific list → blocked
+    try std.testing.expect(!p.isCommandAllowed("ls -la"));
+    try std.testing.expect(!p.isCommandAllowed("echo hi"));
+    // Other non-default also blocked
+    try std.testing.expect(!p.isCommandAllowed("date"));
+}
+
+test "full autonomy + wildcard allowed_commands: permits everything" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+    };
+    try std.testing.expect(p.isCommandAllowed("uname -a"));
+    try std.testing.expect(p.isCommandAllowed("ls -la"));
+    try std.testing.expect(p.isCommandAllowed("date"));
+    try std.testing.expect(p.isCommandAllowed("python3 --version"));
+}
+
+test "supervised autonomy + default allowed_commands: permits listed, blocks unlisted" {
+    var p = SecurityPolicy{
+        .autonomy = .supervised,
+    };
+    try std.testing.expect(p.isCommandAllowed("ls -la"));
+    try std.testing.expect(p.isCommandAllowed("echo hello"));
+    try std.testing.expect(!p.isCommandAllowed("uname -a"));
+    try std.testing.expect(!p.isCommandAllowed("date"));
+}
+
+test "supervised autonomy + specific allowed_commands: permits only specified command" {
+    const specific = [_][]const u8{"uname"};
+    var p = SecurityPolicy{
+        .autonomy = .supervised,
+        .allowed_commands = &specific,
+    };
+    try std.testing.expect(p.isCommandAllowed("uname -a"));
+    try std.testing.expect(!p.isCommandAllowed("ls -la"));
+    try std.testing.expect(!p.isCommandAllowed("echo hi"));
+    try std.testing.expect(!p.isCommandAllowed("date"));
+}
+
+test "supervised autonomy + wildcard allowed_commands: permits everything" {
+    var p = SecurityPolicy{
+        .autonomy = .supervised,
+        .allowed_commands = &.{"*"},
+    };
+    try std.testing.expect(p.isCommandAllowed("uname -a"));
+    try std.testing.expect(p.isCommandAllowed("ls -la"));
+    try std.testing.expect(p.isCommandAllowed("date"));
+    try std.testing.expect(p.isCommandAllowed("python3 --version"));
+}
+
+test "read_only autonomy + default allowed_commands: blocks everything" {
+    var p = SecurityPolicy{
+        .autonomy = .read_only,
+    };
+    try std.testing.expect(!p.isCommandAllowed("ls -la"));
+    try std.testing.expect(!p.isCommandAllowed("echo hello"));
+    try std.testing.expect(!p.isCommandAllowed("uname -a"));
+}
+
+test "read_only autonomy + specific allowed_commands: blocks everything" {
+    const specific = [_][]const u8{"uname"};
+    var p = SecurityPolicy{
+        .autonomy = .read_only,
+        .allowed_commands = &specific,
+    };
+    try std.testing.expect(!p.isCommandAllowed("uname -a"));
+    try std.testing.expect(!p.isCommandAllowed("ls -la"));
+}
+
+test "read_only autonomy + wildcard allowed_commands: blocks everything" {
+    var p = SecurityPolicy{
+        .autonomy = .read_only,
+        .allowed_commands = &.{"*"},
+    };
+    try std.testing.expect(!p.isCommandAllowed("uname -a"));
+    try std.testing.expect(!p.isCommandAllowed("ls -la"));
+    try std.testing.expect(!p.isCommandAllowed("echo hello"));
+}
+
+test "full + default validateCommandExecution: default cmd passes, non-default fails" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .block_high_risk_commands = false,
+    };
+    const risk = try p.validateCommandExecution("ls -la", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk);
+
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("uname -a", false),
+    );
+}
+
+test "full + specific validateCommandExecution: specific cmd passes, others fail" {
+    const specific = [_][]const u8{"uname"};
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &specific,
+        .block_high_risk_commands = false,
+    };
+    const risk = try p.validateCommandExecution("uname -a", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk);
+
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("ls -la", false),
+    );
+}
+
+test "full + wildcard validateCommandExecution: all risk levels pass" {
+    var p = SecurityPolicy{
+        .autonomy = .full,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+    };
+    const low = try p.validateCommandExecution("ls -la", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, low);
+
+    const med = try p.validateCommandExecution("npm install express", false);
+    try std.testing.expectEqual(CommandRiskLevel.medium, med);
+
+    const high = try p.validateCommandExecution("curl https://example.com", false);
+    try std.testing.expectEqual(CommandRiskLevel.high, high);
+}
+
+test "supervised + default validateCommandExecution: default low-risk passes, non-default fails" {
+    var p = SecurityPolicy{
+        .autonomy = .supervised,
+        .require_approval_for_medium_risk = false,
+    };
+    const risk = try p.validateCommandExecution("ls -la", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk);
+
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("uname -a", false),
+    );
+}
+
+test "supervised + specific validateCommandExecution: specific passes, others fail" {
+    const specific = [_][]const u8{"uname"};
+    var p = SecurityPolicy{
+        .autonomy = .supervised,
+        .allowed_commands = &specific,
+    };
+    const risk = try p.validateCommandExecution("uname -a", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, risk);
+
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("ls -la", false),
+    );
+}
+
+test "supervised + wildcard validateCommandExecution: approval gates apply" {
+    var p = SecurityPolicy{
+        .autonomy = .supervised,
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = true,
+    };
+    // Low-risk passes without approval
+    const low = try p.validateCommandExecution("ls -la", false);
+    try std.testing.expectEqual(CommandRiskLevel.low, low);
+
+    // Medium-risk requires approval
+    try std.testing.expectError(
+        error.ApprovalRequired,
+        p.validateCommandExecution("npm install express", false),
+    );
+    // Medium-risk with approval passes
+    const med = try p.validateCommandExecution("npm install express", true);
+    try std.testing.expectEqual(CommandRiskLevel.medium, med);
+
+    // High-risk unapproved requires approval
+    try std.testing.expectError(
+        error.ApprovalRequired,
+        p.validateCommandExecution("curl https://example.com", false),
+    );
+}
+
+test "read_only + default validateCommandExecution: always CommandNotAllowed" {
+    var p = SecurityPolicy{
+        .autonomy = .read_only,
+    };
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("ls -la", false),
+    );
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("uname -a", false),
+    );
+}
+
+test "read_only + specific validateCommandExecution: always CommandNotAllowed" {
+    const specific = [_][]const u8{"uname"};
+    var p = SecurityPolicy{
+        .autonomy = .read_only,
+        .allowed_commands = &specific,
+    };
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("uname -a", false),
+    );
+}
+
+test "read_only + wildcard validateCommandExecution: always CommandNotAllowed" {
+    var p = SecurityPolicy{
+        .autonomy = .read_only,
+        .allowed_commands = &.{"*"},
+    };
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("uname -a", false),
+    );
+    try std.testing.expectError(
+        error.CommandNotAllowed,
+        p.validateCommandExecution("ls -la", false),
+    );
+}
