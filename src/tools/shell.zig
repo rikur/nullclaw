@@ -397,7 +397,7 @@ test "shell ApprovalRequired propagates oom for error message allocation" {
     );
 }
 
-test "shell with full autonomy and wildcard allows all base commands" {
+test "shell with full autonomy and wildcard executes non-default command" {
     const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -415,7 +415,8 @@ test "shell with full autonomy and wildcard allows all base commands" {
 
     var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
 
-    const parsed = try root.parseTestArgs("{\"command\": \"echo hello\"}");
+    // Use uname which is NOT in default_allowed_commands, validating wildcard behavior
+    const parsed = try root.parseTestArgs("{\"command\": \"uname\"}");
     defer parsed.deinit();
     const result = try st.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
@@ -423,7 +424,7 @@ test "shell with full autonomy and wildcard allows all base commands" {
     try std.testing.expect(result.success);
 }
 
-test "shell without policy allows all commands" {
+test "shell without policy executes commands" {
     const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
