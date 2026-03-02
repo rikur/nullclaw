@@ -25,6 +25,7 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const default_allowed_commands = @import("../security/policy.zig").default_allowed_commands;
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -279,6 +280,8 @@ pub const Agent = struct {
 
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
+    /// True when policy was heap-allocated by fromConfig and must be freed in deinit.
+    policy_owned: bool = false,
 
     /// Optional streaming callback. When set, turn() uses streamChat() for streaming providers.
     stream_callback: ?providers.StreamCallback = null,
@@ -346,6 +349,27 @@ pub const Agent = struct {
             };
         }
 
+        // Build security policy from autonomy config
+        const policy_ptr = try allocator.create(SecurityPolicy);
+        errdefer allocator.destroy(policy_ptr);
+        policy_ptr.* = .{
+            .autonomy = cfg.autonomy.level,
+            .workspace_dir = cfg.workspace_dir,
+            .workspace_only = cfg.autonomy.workspace_only,
+            .allowed_commands = if (cfg.autonomy.allowed_commands.len > 0)
+                cfg.autonomy.allowed_commands
+            else
+                &default_allowed_commands,
+            .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
+            .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
+            .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+        };
+        const exec_security: ExecSecurity = switch (cfg.autonomy.level) {
+            .full => .full,
+            .supervised => .allowlist,
+            .read_only => .deny,
+        };
+
         return .{
             .allocator = allocator,
             .provider = provider_i,
@@ -380,10 +404,16 @@ pub const Agent = struct {
             .total_tokens = 0,
             .has_system_prompt = false,
             .last_turn_compacted = false,
+            .policy = policy_ptr,
+            .policy_owned = true,
+            .exec_security = exec_security,
         };
     }
 
     pub fn deinit(self: *Agent) void {
+        if (self.policy_owned) {
+            if (self.policy) |p| self.allocator.destroy(p);
+        }
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
@@ -4106,4 +4136,133 @@ test "Agent shouldForceActionFollowThrough detects russian deferred promise" {
 test "Agent shouldForceActionFollowThrough ignores normal final answer" {
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("Вот результат: файл успешно отправлен."));
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
+}
+
+test "Agent.fromConfig sets policy from autonomy config" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .full;
+    cfg.autonomy.allowed_commands = &.{"*"};
+    cfg.autonomy.require_approval_for_medium_risk = false;
+    cfg.autonomy.block_high_risk_commands = false;
+    cfg.autonomy.max_actions_per_hour = 10000;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.policy != null);
+
+    const pol = agent.policy.?;
+    try std.testing.expectEqual(@as(@TypeOf(pol.autonomy), .full), pol.autonomy);
+    try std.testing.expectEqual(@as(usize, 1), pol.allowed_commands.len);
+    try std.testing.expectEqualStrings("*", pol.allowed_commands[0]);
+    try std.testing.expect(!pol.require_approval_for_medium_risk);
+    try std.testing.expect(!pol.block_high_risk_commands);
+    try std.testing.expectEqual(@as(u32, 10000), pol.max_actions_per_hour);
+}
+
+test "Agent.fromConfig wildcard allowed_commands permits arbitrary commands end-to-end" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .full;
+    cfg.autonomy.allowed_commands = &.{"*"};
+    cfg.autonomy.block_high_risk_commands = false;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    const pol = agent.policy orelse {
+        try std.testing.expect(false);
+        return;
+    };
+    try std.testing.expect(pol.isCommandAllowed("python3 script.py"));
+    try std.testing.expect(pol.isCommandAllowed("node server.js"));
+    try std.testing.expect(pol.isCommandAllowed("zig build"));
+}
+
+test "Agent.fromConfig default autonomy (supervised) sets non-null policy" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.policy != null);
+    try std.testing.expectEqual(@as(@TypeOf(agent.policy.?.autonomy), .supervised), agent.policy.?.autonomy);
+}
+
+test "Agent.fromConfig empty allowed_commands falls back to default_allowed_commands" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .supervised;
+    cfg.autonomy.allowed_commands = &.{};
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    const pol = agent.policy.?;
+    try std.testing.expect(pol.allowed_commands.len > 0);
+    var found_ls = false;
+    for (pol.allowed_commands) |cmd| {
+        if (std.mem.eql(u8, cmd, "ls")) found_ls = true;
+    }
+    try std.testing.expect(found_ls);
+}
+
+test "Agent.fromConfig full level maps to exec_security full" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .full;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectEqual(Agent.ExecSecurity.full, agent.exec_security);
+}
+
+test "Agent.fromConfig read_only level maps to exec_security deny" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .read_only;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectEqual(Agent.ExecSecurity.deny, agent.exec_security);
 }
