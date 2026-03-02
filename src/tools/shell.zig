@@ -397,7 +397,7 @@ test "shell ApprovalRequired propagates oom for error message allocation" {
     );
 }
 
-test "shell with full autonomy and wildcard allows all base commands" {
+test "shell with full autonomy and wildcard executes non-default command" {
     const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -415,7 +415,8 @@ test "shell with full autonomy and wildcard allows all base commands" {
 
     var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
 
-    const parsed = try root.parseTestArgs("{\"command\": \"echo hello\"}");
+    // Use uname which is NOT in default_allowed_commands, validating wildcard behavior
+    const parsed = try root.parseTestArgs("{\"command\": \"uname\"}");
     defer parsed.deinit();
     const result = try st.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
@@ -423,7 +424,7 @@ test "shell with full autonomy and wildcard allows all base commands" {
     try std.testing.expect(result.success);
 }
 
-test "shell without policy allows all commands" {
+test "shell without policy executes commands" {
     const builtin = @import("builtin");
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
@@ -435,4 +436,266 @@ test "shell without policy allows all commands" {
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(result.success);
+}
+
+// ── Comprehensive e2e shell: autonomy × allowed_commands matrix ──
+
+test "shell e2e full + default: default command succeeds, non-default blocked" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer tracker.deinit();
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .block_high_risk_commands = false,
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+
+    // Default command (echo) succeeds
+    {
+        const parsed = try root.parseTestArgs("{\"command\": \"echo e2e-default\"}");
+        defer parsed.deinit();
+        const result = try st.execute(std.testing.allocator, parsed.value.object);
+        defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+        try std.testing.expect(result.success);
+    }
+
+    // Non-default command (uname) blocked by allowlist — error_msg is a literal from ToolResult.fail
+    {
+        const parsed = try root.parseTestArgs("{\"command\": \"uname\"}");
+        defer parsed.deinit();
+        const result = try st.execute(std.testing.allocator, parsed.value.object);
+        try std.testing.expect(!result.success);
+        try std.testing.expect(result.error_msg != null);
+    }
+}
+
+test "shell e2e full + specific: specific command succeeds, others blocked" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer tracker.deinit();
+    const specific = [_][]const u8{"uname"};
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &specific,
+        .block_high_risk_commands = false,
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+
+    // Specific command (uname) succeeds
+    {
+        const parsed = try root.parseTestArgs("{\"command\": \"uname\"}");
+        defer parsed.deinit();
+        const result = try st.execute(std.testing.allocator, parsed.value.object);
+        defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+        try std.testing.expect(result.success);
+    }
+
+    // Non-specific command (echo, normally default) blocked — literal error_msg
+    {
+        const parsed = try root.parseTestArgs("{\"command\": \"echo blocked\"}");
+        defer parsed.deinit();
+        const result = try st.execute(std.testing.allocator, parsed.value.object);
+        try std.testing.expect(!result.success);
+    }
+}
+
+test "shell e2e full + wildcard: non-default command succeeds" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer tracker.deinit();
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+
+    const parsed = try root.parseTestArgs("{\"command\": \"uname\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+}
+
+test "shell e2e supervised + default: default low-risk succeeds, non-default blocked" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer tracker.deinit();
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .require_approval_for_medium_risk = false,
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+
+    // Default low-risk command succeeds
+    {
+        const parsed = try root.parseTestArgs("{\"command\": \"echo supervised-default\"}");
+        defer parsed.deinit();
+        const result = try st.execute(std.testing.allocator, parsed.value.object);
+        defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+        try std.testing.expect(result.success);
+    }
+
+    // Non-default command blocked — literal error_msg
+    {
+        const parsed = try root.parseTestArgs("{\"command\": \"uname\"}");
+        defer parsed.deinit();
+        const result = try st.execute(std.testing.allocator, parsed.value.object);
+        try std.testing.expect(!result.success);
+    }
+}
+
+test "shell e2e supervised + specific: specific low-risk succeeds, others blocked" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer tracker.deinit();
+    const specific = [_][]const u8{"uname"};
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &specific,
+        .require_approval_for_medium_risk = false,
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+
+    // Specific command succeeds
+    {
+        const parsed = try root.parseTestArgs("{\"command\": \"uname\"}");
+        defer parsed.deinit();
+        const result = try st.execute(std.testing.allocator, parsed.value.object);
+        defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+        try std.testing.expect(result.success);
+    }
+
+    // Default command not in specific list → blocked — literal error_msg
+    {
+        const parsed = try root.parseTestArgs("{\"command\": \"echo blocked\"}");
+        defer parsed.deinit();
+        const result = try st.execute(std.testing.allocator, parsed.value.object);
+        try std.testing.expect(!result.success);
+    }
+}
+
+test "shell e2e supervised + wildcard: low-risk non-default succeeds" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer tracker.deinit();
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &.{"*"},
+        .require_approval_for_medium_risk = false,
+        .block_high_risk_commands = false,
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+
+    const parsed = try root.parseTestArgs("{\"command\": \"uname\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+}
+
+test "shell e2e read_only + default: all commands blocked" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer tracker.deinit();
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .read_only,
+        .workspace_dir = "/tmp",
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+
+    // Literal error_msg from ToolResult.fail — do not free
+    const parsed = try root.parseTestArgs("{\"command\": \"echo blocked\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+}
+
+test "shell e2e read_only + specific: all commands blocked" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer tracker.deinit();
+    const specific = [_][]const u8{"uname"};
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .read_only,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &specific,
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+
+    // Literal error_msg from ToolResult.fail — do not free
+    const parsed = try root.parseTestArgs("{\"command\": \"uname\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+}
+
+test "shell e2e read_only + wildcard: all commands blocked" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 10000);
+    defer tracker.deinit();
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .read_only,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &.{"*"},
+        .tracker = &tracker,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+
+    // Even with wildcard, read_only blocks everything — literal error_msg
+    const parsed = try root.parseTestArgs("{\"command\": \"echo wildcard-readonly\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
 }
